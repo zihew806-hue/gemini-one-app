@@ -1,7 +1,17 @@
 """
 Gemini One-App Desktop & Mobile Agent (gemini_one_app.py)
 =========================================================
+v1.1.0 (2026-11-13) — 安全鉴权版 / Security-hardened release
 极简合一版：不用装浏览器插件、不用配内网穿透，一个文件搞定【Gemini 大脑 + 电脑全自动执行 + 手机随时随地遥控】！
+
+v1.1 安全更新（重要）：
+- 电脑本机（127.0.0.1 / ::1）访问自动免密；
+- 任何来自手机或外部局域网 IP 对 /run、/config、/logs 的请求，
+  强制校验请求头 X-Agent-Pin（默认 8888，可在网页「⚙️ 一键配置」中修改）；
+- 使用 hmac.compare_digest 做常量时间比较，只信任 TCP 回环地址、
+  忽略可伪造的 X-Forwarded-For，并对连续失败做 5 次 / 60 秒限流，
+  避免公共 Wi-Fi 现场演示时被同网段端口扫描者直接调用；
+- 手机网页顶部提供 PIN 输入框，值仅保存在浏览器 localStorage，不上传服务器。
 
 为什么这次最简单？
 1. 【电脑端】：双击直接弹出一个可视化窗口，填好 Gemini API Key（或者免 Key 模式），输入一句话，它自己写代码、改文件、跑命令、修 Bug。
@@ -16,6 +26,7 @@ import re
 import sys
 import json
 import time
+import hmac
 import uuid
 import socket
 import shutil
@@ -32,13 +43,15 @@ from typing import Dict, Any, List, Optional
 # =====================================================================
 CONFIG_FILE = Path.home() / ".gemini_one_agent_config.json"
 DEFAULT_WORKSPACE = Path.home() / "Desktop" / "Gemini_Workspace"
+VERSION = "1.1.0"
 
 def load_config() -> Dict[str, Any]:
     default_cfg = {
         "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
         "telegram_bot_token": os.environ.get("TG_BOT_TOKEN", ""),
         "allowed_chat_id": "",          # 留空则自动绑定第一个给它发消息的手机账号
-        "pin_code": "8888",             # 手机网页端访问密码
+        # 远程访问 PIN：优先读取环境变量 AGENT_PIN，默认 8888（首次启动后请立即修改）
+        "pin_code": os.environ.get("AGENT_PIN", "8888"),
         "port": 8765,
         "workspace": str(DEFAULT_WORKSPACE)
     }
@@ -155,6 +168,48 @@ load_custom_plugins()
 
 
 # =====================================================================
+# 2.5 v1.1 安全鉴权层：本机免密 / 外部强制 X-Agent-Pin
+# =====================================================================
+PIN_HEADER = "X-Agent-Pin"
+LOOPBACK_ADDRS = {"127.0.0.1", "::1", "localhost"}
+AUTH_MAX_FAILS = 5          # 同一 IP 在窗口期内允许的最大失败次数
+AUTH_WINDOW_SEC = 60.0      # 失败计数窗口（秒）
+_AUTH_FAILS: Dict[str, List[float]] = {}   # ip -> 最近失败时间戳
+
+
+def is_loopback_request(handler) -> bool:
+    """只信任 TCP 连接的真实回环地址；绝不读取 X-Forwarded-For 等可伪造请求头。"""
+    peer = handler.client_address[0] if handler.client_address else ""
+    return peer in LOOPBACK_ADDRS or peer.startswith("127.")
+
+
+def verify_agent_pin(handler) -> bool:
+    """
+    本机请求直接放行；外部请求必须携带与配置一致的 X-Agent-Pin。
+    常量时间比较 + 简单失败限流，避免公共 Wi-Fi 场景下的口令爆破。
+    """
+    if is_loopback_request(handler):
+        return True
+
+    peer = handler.client_address[0]
+    now = time.time()
+    recent = [t for t in _AUTH_FAILS.get(peer, []) if now - t < AUTH_WINDOW_SEC]
+    _AUTH_FAILS[peer] = recent
+    if len(recent) >= AUTH_MAX_FAILS:
+        return False
+
+    supplied = handler.headers.get(PIN_HEADER, "") or ""
+    expected = str(CFG.get("pin_code", "8888"))
+    if supplied and hmac.compare_digest(supplied, expected):
+        _AUTH_FAILS.pop(peer, None)
+        return True
+
+    recent.append(now)
+    _AUTH_FAILS[peer] = recent
+    return False
+
+
+# =====================================================================
 # 3. Gemini Codex 自主大脑（无需装 SDK，直接走官方 REST API 零依赖调用！）
 # =====================================================================
 SYSTEM_PROMPT = """你是运行在用户电脑上的全能自主 Agent (Gemini-Codex)。
@@ -263,7 +318,7 @@ def execute_autonomous_task(user_goal: str, log_callback=None) -> str:
 # =====================================================================
 # 4. 改进版连接方式：手机端免公网 IP 云端长轮询 (Telegram Bot) + 局域网直连网页
 # =====================================================================
-GLOBAL_LOGS: List[str] = ["✅ Gemini One-App 已启动，随时等待指令..."]
+GLOBAL_LOGS: List[str] = [f"✅ Gemini One-App v{VERSION} 已启动（远程访问已启用 PIN 鉴权）"]
 
 def add_log(text: str):
     ts = time.strftime("%H:%M:%S")
@@ -339,10 +394,16 @@ ONE_PAGE_HTML = """<!DOCTYPE html>
 <div class="wrap">
   <div class="top">
     <div>
-      <h2>⚡ Gemini One-App 电脑执行中心</h2>
+      <h2>⚡ Gemini One-App 电脑执行中心 <span style="font-size:11px;color:#94a3b8;">v1.1 安全版</span></h2>
       <div style="font-size:12px;color:#94a3b8;margin-top:4px;">手机/电脑同屏 · 自动写代码 · 自动改文件 · 自动跑命令</div>
     </div>
     <span style="color:#22c55e;font-size:12px;font-weight:bold;">● 运行中</span>
+  </div>
+
+  <div class="box" style="border-color:#f59e0b;">
+    <div style="font-weight:bold;font-size:14px;">🔐 远程访问 PIN 码（手机 / 外部设备必填，电脑本机自动免密）</div>
+    <input id="agentPin" type="password" inputmode="numeric" autocomplete="off" placeholder="默认 8888，请在下方「⚙️ 一键配置」中改成自己的密码">
+    <div style="font-size:12px;color:#94a3b8;margin-top:6px;">仅保存在本浏览器缓存（localStorage），不会上传；每次请求通过 X-Agent-Pin 请求头校验。</div>
   </div>
 
   <div class="box">
@@ -369,6 +430,8 @@ ONE_PAGE_HTML = """<!DOCTYPE html>
         <input id="apiKey" type="password" placeholder="AIzaSy...">
         <label style="display:block;margin-top:8px;">2. 手机异地 4G/5G 遥控 Token（选填 Telegram Bot Token，免公网IP全球直连）：</label>
         <input id="tgToken" type="password" placeholder="123456:ABC-DEF...">
+        <label style="display:block;margin-top:8px;">3. 修改远程访问 PIN 码（留空表示不变，建议改成自己的 4-8 位数字）：</label>
+        <input id="newPin" type="password" inputmode="numeric" autocomplete="off" placeholder="留空不修改，默认 8888">
         <button class="btn" style="background:#38bdf8;" onclick="saveCfg()">💾 保存配置（永久生效）</button>
       </div>
     </details>
@@ -376,23 +439,58 @@ ONE_PAGE_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+const PIN_KEY = 'gemini_one_app_pin';
+const pinInput = document.getElementById('agentPin');
+const cachedPin = localStorage.getItem(PIN_KEY) || '';
+if (cachedPin) pinInput.value = cachedPin;
+pinInput.addEventListener('input', () => {
+  const v = pinInput.value.trim();
+  if (v) localStorage.setItem(PIN_KEY, v); else localStorage.removeItem(PIN_KEY);
+});
+function pinHeaders() {
+  const p = pinInput.value.trim();
+  return p ? {'X-Agent-Pin': p} : {};
+}
+async function postJSON(path, payload) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: Object.assign({'Content-Type': 'application/json'}, pinHeaders()),
+    body: JSON.stringify(payload)
+  });
+  if (r.status === 401) {
+    alert('🔐 PIN 校验失败或已触发限流，请检查页面顶部 PIN 码（默认 8888），稍后重试');
+    throw new Error('unauthorized');
+  }
+  return r;
+}
 async function runTask(preset) {
   const g = preset || document.getElementById('goal').value.trim();
   if (!g) return alert('请输入指令');
   document.getElementById('goal').value = '';
-  await fetch('/run', {method:'POST', body: JSON.stringify({goal: g})});
-  pollLogs();
+  try { await postJSON('/run', {goal: g}); pollLogs(); } catch (e) { /* 已提示 */ }
 }
 async function saveCfg() {
-  const k = document.getElementById('apiKey').value.trim();
-  const t = document.getElementById('tgToken').value.trim();
-  await fetch('/config', {method:'POST', body: JSON.stringify({gemini_api_key: k, telegram_bot_token: t})});
-  alert('✅ 保存成功！');
+  const payload = {
+    gemini_api_key: document.getElementById('apiKey').value.trim(),
+    telegram_bot_token: document.getElementById('tgToken').value.trim(),
+    pin_code: document.getElementById('newPin').value.trim()
+  };
+  try {
+    await postJSON('/config', payload);
+    if (payload.pin_code) {
+      localStorage.setItem(PIN_KEY, payload.pin_code);
+      pinInput.value = payload.pin_code;
+      document.getElementById('newPin').value = '';
+    }
+    alert('✅ 保存成功！');
+  } catch (e) { /* 已提示 */ }
 }
 async function pollLogs() {
-  const r = await fetch('/logs');
-  const d = await r.json();
+  const r = await fetch('/logs', {headers: pinHeaders()});
   const el = document.getElementById('logs');
+  if (r.status === 401) { el.textContent = '🔐 PIN 校验失败：请在页面顶部填写正确的 PIN 码（默认 8888）。'; return; }
+  if (!r.ok) { el.textContent = '日志读取失败：HTTP ' + r.status; return; }
+  const d = await r.json();
   el.textContent = d.logs.join('\\n');
   el.scrollTop = el.scrollHeight;
 }
@@ -405,12 +503,34 @@ pollLogs();
 
 
 class SimpleHandler(BaseHTTPRequestHandler):
+    server_version = "GeminiOneApp/" + VERSION
+
+    def _reject_unauthorized(self):
+        peer = self.client_address[0]
+        add_log(f"⛔ 拒绝未授权请求 {peer} -> {self.path}（PIN 校验失败或已触发限流）")
+        body = json.dumps(
+            {"error": "Unauthorized", "detail": "missing or invalid X-Agent-Pin"},
+            ensure_ascii=False
+        ).encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == "/logs":
+        # 页面本身放行，方便手机先打开界面输入 PIN；所有数据 / 指令接口一律校验
+        if self.path.split("?")[0] == "/logs":
+            if not verify_agent_pin(self):
+                self._reject_unauthorized()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            self.wfile.write(json.dumps({"logs": GLOBAL_LOGS}, ensure_ascii=False).encode("utf-8"))
+            self.wfile.write(
+                json.dumps({"logs": GLOBAL_LOGS, "version": VERSION}, ensure_ascii=False).encode("utf-8")
+            )
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -418,6 +538,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.wfile.write(ONE_PAGE_HTML.encode("utf-8"))
 
     def do_POST(self):
+        # /run 与 /config 先过鉴权：未授权请求不读取 body、不触发任何本地动作
+        if not verify_agent_pin(self):
+            self._reject_unauthorized()
+            return
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         if self.path == "/run":
@@ -427,15 +551,18 @@ class SimpleHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
         elif self.path == "/config":
-            if body.get("gemini_api_key"):
-                CFG["gemini_api_key"] = body["gemini_api_key"]
-            if body.get("telegram_bot_token"):
-                CFG["telegram_bot_token"] = body["telegram_bot_token"]
+            for key in ("gemini_api_key", "telegram_bot_token", "pin_code"):
+                val = body.get(key)
+                if isinstance(val, str) and val.strip():
+                    CFG[key] = val.strip()
             save_config(CFG)
             add_log("⚙️ 已更新并保存系统配置！")
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, format, *args):
         pass
@@ -467,12 +594,14 @@ def main():
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
     lan_ip = get_local_ip()
 
-    print("\n" + "=" * 60)
-    print("  🚀 Gemini One-App 已启动！（彻底免插件、免复杂配置）")
-    print(f"  👉 电脑控制界面: http://127.0.0.1:{port}")
-    print(f"  📱 手机Wi-Fi直连: http://{lan_ip}:{port}")
+    print("\n" + "=" * 68)
+    print(f"  🚀 Gemini One-App v{VERSION} 已启动！（免插件、免复杂配置）")
+    print(f"  👉 电脑控制界面: http://127.0.0.1:{port}   （本机自动免密）")
+    print(f"  📱 手机Wi-Fi直连: http://{lan_ip}:{port}   （需在页面顶部填写 PIN 码）")
+    print("  🔐 远程鉴权: 非本机请求强制校验请求头 X-Agent-Pin")
+    print("     ⚠️ 默认口令为 8888，请在「⚙️ 一键配置」中立即修改；公共 Wi-Fi 演示前务必改！")
     print(f"  📂 自动工作目录: {CFG['workspace']}")
-    print("=" * 60 + "\n")
+    print("=" * 68 + "\n")
 
     # 自动弹出一个独立应用窗口（优先用 Edge/Chrome 的 --app 独立窗口模式，看起来就像原生桌面软件！）
     url = f"http://127.0.0.1:{port}"
