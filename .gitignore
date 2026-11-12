@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Local runtime config / workspace (may contain API keys)
+.gemini_one_agent_config.json
+Gemini_Workspace/
+screen_capture.png
+auto_task.py
+
+# Packaging
+dist/
+build/
+*.spec
+
+.DS_Store
